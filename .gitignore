@@ -1,0 +1,12 @@
+connections.toml
+*.p8
+*.pem
+*.key
+.env
+__pycache__/
+.venv/
+*.pyc
+.cortex/cache/
+output/
+*.log
+.DS_Store
