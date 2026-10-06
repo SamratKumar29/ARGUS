@@ -10,3 +10,4 @@ __pycache__/
 output/
 *.log
 .DS_Store
+snowflakeplan.md
