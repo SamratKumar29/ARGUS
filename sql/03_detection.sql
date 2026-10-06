@@ -1,0 +1,115 @@
+-- ==============================================================================
+-- 03_DETECTION.SQL — T1 STRUCTURING Detector
+-- Reads threshold / currency / lookback / filing-deadline from DOC.V_ACTIVE_POLICY_RULES.
+-- No thresholds are hardcoded in this script.
+-- Idempotent for a given detection run (keyed by DETECTION_RUN_ID).
+-- ==============================================================================
+
+USE ROLE ARGUS_ADMIN;
+USE WAREHOUSE ARGUS_WH;
+USE DATABASE ARGUS;
+USE SCHEMA CURATED;
+
+-- 1. ALERTS table
+CREATE TABLE IF NOT EXISTS ARGUS.CURATED.ALERTS (
+    ALERT_ID            VARCHAR(64)   NOT NULL,
+    ALERT_TS            TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+    ENTITY_ID            VARCHAR(16)   NOT NULL,
+    ENTITY_TYPE          VARCHAR(16)   NOT NULL,
+    TYPOLOGY_CODE        VARCHAR(32)   NOT NULL,
+    RULE_ID              VARCHAR(64)   NOT NULL,
+    CLAUSE_REF           VARCHAR(32)   NOT NULL,
+    SEVERITY             VARCHAR(16)   NOT NULL,
+    RAW_SCORE            FLOAT         NOT NULL,
+    SUPPRESSION_REASON   VARCHAR(512),
+    STATUS               VARCHAR(16)   NOT NULL DEFAULT 'OPEN',
+    AS_OF_DATE           DATE          NOT NULL,
+    DETECTION_RUN_ID     VARCHAR(64)   NOT NULL,
+    EXPLANATION          VARCHAR(1000) NOT NULL,
+    AGGREGATE_AMOUNT     NUMBER(18,2)  NOT NULL,
+    MAX_INDIVIDUAL_AMOUNT NUMBER(18,2) NOT NULL,
+    FILING_DEADLINE_DATE DATE          NOT NULL,
+    CONSTRAINT PK_ALERTS PRIMARY KEY (ALERT_ID)
+);
+
+-- 2. Resolve this run's identifiers as session variables (sourced from policy view + data,
+--    never hardcoded).
+SET DETECTION_RUN_ID = 'RUN-' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYYMMDD_HH24MISS');
+
+-- 3. T1 STRUCTURING detection + alert insert.
+--    All thresholds/lookback/filing-deadline are read from DOC.V_ACTIVE_POLICY_RULES
+--    via the RULE CTE below — none are hardcoded in this query.
+INSERT INTO ARGUS.CURATED.ALERTS (
+    ALERT_ID, ALERT_TS, ENTITY_ID, ENTITY_TYPE, TYPOLOGY_CODE, RULE_ID, CLAUSE_REF,
+    SEVERITY, RAW_SCORE, SUPPRESSION_REASON, STATUS, AS_OF_DATE, DETECTION_RUN_ID,
+    EXPLANATION, AGGREGATE_AMOUNT, MAX_INDIVIDUAL_AMOUNT, FILING_DEADLINE_DATE
+)
+WITH RULE AS (
+    SELECT RULE_ID, CLAUSE_REF, TYPOLOGY_CODE, THRESHOLD_VALUE, THRESHOLD_CURRENCY,
+           MAX_INDIVIDUAL_VALUE, LOOKBACK_DAYS, FILING_DEADLINE_DAYS
+    FROM ARGUS.DOC.V_ACTIVE_POLICY_RULES
+    WHERE TYPOLOGY_CODE = 'STRUCTURING'
+),
+AS_OF AS (
+    -- As-of date = latest transaction date in the dataset (this is a point-in-time
+    -- detection run over the static synthetic dataset, not a live/continuous job)
+    SELECT MAX(TXN_TS)::DATE AS AS_OF_DATE FROM ARGUS.RAW.TRANSACTIONS
+),
+WINDOWED_CASH_CREDITS AS (
+    SELECT
+        t.ACCOUNT_ID,
+        SUM(t.AMOUNT) AS AGGREGATE_AMOUNT,
+        MAX(t.AMOUNT) AS MAX_INDIVIDUAL_AMOUNT,
+        COUNT(*) AS CASH_CREDIT_COUNT
+    FROM ARGUS.RAW.TRANSACTIONS t
+    CROSS JOIN AS_OF
+    CROSS JOIN RULE r
+    WHERE t.DIRECTION = 'CREDIT'
+      AND t.IS_CASH = TRUE
+      AND t.TXN_TS::DATE > DATEADD('day', -r.LOOKBACK_DAYS, AS_OF.AS_OF_DATE)
+      AND t.TXN_TS::DATE <= AS_OF.AS_OF_DATE
+    GROUP BY t.ACCOUNT_ID
+),
+QUALIFYING_ACCOUNTS AS (
+    SELECT
+        w.ACCOUNT_ID,
+        w.AGGREGATE_AMOUNT,
+        w.MAX_INDIVIDUAL_AMOUNT,
+        w.CASH_CREDIT_COUNT
+    FROM WINDOWED_CASH_CREDITS w
+    CROSS JOIN RULE r
+    WHERE w.AGGREGATE_AMOUNT >= r.THRESHOLD_VALUE
+      AND w.MAX_INDIVIDUAL_AMOUNT < r.MAX_INDIVIDUAL_VALUE
+)
+SELECT
+    'ALERT-' || qa.ACCOUNT_ID || '-' || r.TYPOLOGY_CODE AS ALERT_ID,
+    CURRENT_TIMESTAMP() AS ALERT_TS,
+    qa.ACCOUNT_ID AS ENTITY_ID,
+    'ACCOUNT' AS ENTITY_TYPE,
+    r.TYPOLOGY_CODE,
+    r.RULE_ID,
+    r.CLAUSE_REF,
+    'HIGH' AS SEVERITY,
+    LEAST(qa.AGGREGATE_AMOUNT / r.THRESHOLD_VALUE, 3.0) AS RAW_SCORE,
+    NULL AS SUPPRESSION_REASON,
+    'OPEN' AS STATUS,
+    ao.AS_OF_DATE,
+    $DETECTION_RUN_ID AS DETECTION_RUN_ID,
+    'Account ' || qa.ACCOUNT_ID || ' accumulated ' || qa.CASH_CREDIT_COUNT ||
+        ' cash credits totalling VRD ' || TO_VARCHAR(qa.AGGREGATE_AMOUNT, '999,999,999.00') ||
+        ' within ' || r.LOOKBACK_DAYS || ' days (as of ' || ao.AS_OF_DATE ||
+        '), with no individual credit reaching VRD ' || TO_VARCHAR(r.MAX_INDIVIDUAL_VALUE, '999,999,999.00') ||
+        '. This meets the STRUCTURING threshold under ' || r.RULE_ID ||
+        ' / clause ' || r.CLAUSE_REF || '.' AS EXPLANATION,
+    qa.AGGREGATE_AMOUNT,
+    qa.MAX_INDIVIDUAL_AMOUNT,
+    DATEADD('day', r.FILING_DEADLINE_DAYS, ao.AS_OF_DATE) AS FILING_DEADLINE_DATE
+FROM QUALIFYING_ACCOUNTS qa
+CROSS JOIN RULE r
+CROSS JOIN AS_OF ao
+WHERE qa.ACCOUNT_ID NOT IN (
+    SELECT ALERT.ENTITY_ID FROM ARGUS.CURATED.ALERTS AS ALERT
+    WHERE ALERT.TYPOLOGY_CODE = r.TYPOLOGY_CODE AND ALERT.STATUS != 'SUPPRESSED'
+);
+
+SELECT 'Detection run complete' AS STATUS, $DETECTION_RUN_ID AS DETECTION_RUN_ID;
