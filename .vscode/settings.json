@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 - <<'PY'\nimport csv\nfrom pathlib import Path\nfor name in \\['parties\\.csv','accounts\\.csv','transactions\\.csv','ground_truth\\.csv'\\]:\n    path=Path\\('data/generated'\\)/name\n    with path\\.open\\(newline='', encoding='utf-8'\\) as f:\n        rows=list\\(csv\\.reader\\(f\\)\\)\n    print\\(f'\\{name\\}: rows=\\{len\\(rows\\)-1\\}, columns=\\{len\\(rows\\[0\\]\\)\\}'\\)\n    print\\('  header:', ','\\.join\\(rows\\[0\\]\\)\\)\nPY$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
