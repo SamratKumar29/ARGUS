@@ -11,3 +11,4 @@ output/
 *.log
 .DS_Store
 snowflakeplan.md
+.vscode/
